@@ -1,0 +1,24 @@
+{
+  "name": "auto_add_from_amazon",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "discord-webhook-node": "1.1.8",
+    "dotenv": "16.4.5",
+    "keytar": "7.9.0",
+    "node-notifier": "10.0.1",
+    "node-windows": "1.0.0-beta.8",
+    "puppeteer": "23.9.0",
+    "puppeteer-core": "^23.9.0",
+    "puppeteer-extra": "^3.3.6",
+    "regenerator-runtime": "0.14.1",
+    "string-similarity": "^4.0.4"
+  }
+}

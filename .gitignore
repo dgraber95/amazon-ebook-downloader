@@ -128,3 +128,9 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+.vscode/launch.json
+config.json
+cookies.json
+examined_titles.json
+libby_loan_info.json
+config_old.json
