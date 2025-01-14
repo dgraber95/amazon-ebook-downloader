@@ -11,6 +11,7 @@ const AMAZON_USER_NAMESPACE = "amazon_credentials"
 const AMAZON_2FA_NAMESPACE = "amazon_2fa"
 
 const TITLES_FILE = path.join(__dirname, 'examined_titles.json'); // File containing already examined titles
+const configPath = path.join(__dirname, 'config.json');
 
 let cnfg; // Global config object
 let hook = null; // discord webhook (config dependent)
@@ -23,25 +24,16 @@ const MSINH = MSINS * SECINMIN * MININHR;
 
 // Default configuration
 const dfltCnfg = {
-    "run_interval": 30,
+    "amazon_email": "",
+    "amazon_password": "",
+    "run_interval_sec": 30,
     "headless": false,
     "browser_path": "C:/Program Files/Google/Chrome/Application/chrome.exe",
     "downloads_dir": "",
     "return_after_hrs": 48,
-    "kindle_name": "",
+    "device_name": "",
     "calibre_lib_path": "",
     "min_similarity": 0.4,
-    // "send_to_kindle_emails": {
-    //   "my_kindle_email@kindle.com": "Name of Kindle to display in Webhook message"
-    // },
-    // "smtp_cnfg": {
-    //   "hostname": "smtp.gmail.com",
-    //   "port": 587,
-    //   "smtp_username": "email@gmail.com",
-    //   "smtp_password": "smtp password",
-    //   "encryption": "TLS",
-    //   "send_from": "send_from_email@gmail.com"
-    // }
   }
   
 // Define log file paths
@@ -255,8 +247,8 @@ async function login_main(page) {
 
     console.log("Checking login conditions...");
 
-    // Stop retrying after 1 minute
-    if (Date.now() - startTime > 60000) {
+    // Stop retrying after a time
+    if (Date.now() - startTime > 20000) {
         console.error("ERROR: Login process timed out.");
         await hook.send("ERROR: Login process timed out.");
         process.exit(1);
@@ -461,7 +453,7 @@ async function downloadBook(page, book, title) {
 
     // Select configured Kindle from the list of devices
     console.log('Selecting configured Kindle');
-    await page.evaluate(async (entity_details) => {
+    let success = await page.evaluate(async (entity_details, device_name) => {
         const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
         const transferList = entity_details.querySelector('ul[id*="download_and_transfer_list"]');
         if (transferList) {
@@ -473,15 +465,22 @@ async function downloadBook(page, book, title) {
                 if (divChildren.length > 1) {
                     const secondDivText = divChildren[1].innerText;
 
-                    if (secondDivText.includes(cnfg.kindle_name)) {
+                    if (secondDivText.includes(device_name)) {
                         // Select the input and click it
                         liElement.querySelector('input').click();
-                        return;
+                        return true;
                     }
                 }
             }
         }
-    }, book);
+        return false;
+    }, book, cnfg.device_name);
+
+    if(!success){
+        console.error(`Failed to select configured device '${cnfg.device_name}' for eBook download.\n\tConfirm that there is a device registered under '${cnfg.device_name}' on your account.`)
+        await hook.send(`Failed to select configured device '${cnfg.device_name}' for eBook download.\n\tConfirm that there is a device registered under '${cnfg.device_name}' on your account.`)
+        process.exit(-1);
+    }
 
     await delay(1000);
 
@@ -493,7 +492,7 @@ async function downloadBook(page, book, title) {
         await hook.send('Could not find Download button after selecting device');
         process.exit(-1);
     }
-    let success = await page.evaluate(async (entity_details) => {
+    success = await page.evaluate(async (entity_details) => {
         // Press download
         const downloadButton = entity_details.querySelector('div[id^="DOWNLOAD_AND_TRANSFER_ACTION_"][id$="_CONFIRM"]');
         if (downloadButton) {
@@ -726,35 +725,6 @@ async function getLibbyLoans() {
         process.exit(-1);
     }
 
-
-
-    // fs.readFileSync(loan_info_json, 'utf8', (err, data) => {
-    //     if (err) {
-    //         console.error('Failed to read latest Libby loan info');
-    //         await hook.send('Failed to read latest Libby loan info');
-    //         process.exit(-1);
-    //     }
-    //     try {
-    //         // Parse the JSON data
-    //         const loans = JSON.parse(data);
-
-    //         // Extract the required information
-    //         loans.forEach(loan => {
-    //             // Check for Kindle format in formats
-    //             const hasKindleFormat = loan.formats.some(format => format.id === 'ebook-kindle');
-    //             if(hasKindleFormat){
-    //                 libby_ebooks.push(loan.title);
-    //                 console.log(`Title: ${loan.title}`);
-    //             }
-    //         });
-    
-    //     } catch (parseErr) {
-    //         console.error('Error parsing the JSON data:', parseErr);
-    //         await hook.send('Failed to parse latest Libby loan info');
-    //         process.exit(-1);
-    //     }
-    // });
-
     return libby_ebooks;
 }
 
@@ -765,6 +735,47 @@ async function getNewLibbyLoans(libby_ebooks, examinedTitles){
         console.log(new_books);
     }
     return(new_books);
+}
+
+async function getNewBooksFromAmazon(page, examinedTitles){
+    // Get all elements with the class beginning with '.div[class^="DigitalEntitySummary-module__container"]'
+    const bookEntities = await page.$$(
+        'div[class^="DigitalEntitySummary-module__container"]'
+    );
+
+    let new_ebooks = []
+
+    // Iterate over each book entity
+    for (const book of bookEntities) {
+        // Get book title
+        const bookTitle = await page.evaluate(entity_details => {
+            const title = entity_details.querySelector('.digital_entity_title');
+            return title ? title.textContent : '';
+        }, book);
+        if(!bookTitle){
+            console.error('Could not find book title');
+        }
+
+        // if this book has already been examined, skip it
+        if(bookTitle in examinedTitles){
+            continue;
+        }
+
+        // if this is not a library loan, skip it
+        const library_loan = await page.evaluate(entity_details => {
+            const information_row = entity_details.querySelector('span .information_row').textContent;
+            return information_row.includes('book is a Kindle digital library loan');
+        }, book);
+        if(!library_loan){
+            continue;
+        }
+
+        // add to return list
+        new_ebooks.push(bookTitle);
+        
+    } // end book iter
+
+    return new_ebooks;
 }
 
 async function openBooksPage(){
@@ -804,67 +815,50 @@ async function main() {
     // Read the previously examined titles
     let examinedTitles = readExaminedTitles();
 
-    // First, check to see if libby has any new loans.
-    // May need to run odmpy libby first to log in
-    const libby_ebooks = await getLibbyLoans();
-    let new_libby_ebooks = [];
-    if(libby_ebooks.length >= 1){
-        new_libby_ebooks = await getNewLibbyLoans(libby_ebooks, examinedTitles);
-        if(new_libby_ebooks.length < 1){
-            console.log('No new loans found.');
-        }
+    // Open a browser, log in, and get the list of books
+    // to download
+    let {browser, page} = await openBooksPage();
+
+    startTime = 0;
+    let logged_in = await login_main(page, examinedTitles);
+    if(logged_in == false){
+        console.error(`Failed to log in`);
+        await hook.send(`Failed to log in`);
+        await browser.close();
+        process.exit(-1);
+    }
+
+    let new_ebooks = await getNewBooksFromAmazon(page, examinedTitles);
+    if(!(new_ebooks.length > 0)){
+        console.log('No new loans found.');
+        await browser.close();
     }
 
     // Iterate over each new book and create a browser
     // instance to download them individually. I haven't
     // figured out how to get Chrome to download multiple
     // files automatically
-    for (const new_book of new_libby_ebooks) {
-        // const browser = await puppeteer.launch({
-        //     headless: cnfg.headless,
-        //     timeout: 60000, // Increase the launch timeout (default is 30,000 ms)
-        //     devtools: true,   // Open DevTools automatically
-        //     executablePath: cnfg.browser_path
-        //  });
-        // const page = await browser.newPage();
-    
-        // // Get the dimensions of the screen
-        // const { width, height } = await page.evaluate(() => ({
-        //     width: window.screen.width,
-        //     height: window.screen.height,
-        // }));
-    
-        // // Resize the window to full screen size minus taskbar height
-        // await page.setViewport({ width, height: height - 80 }); // Adjust height as necessary
-    
-        // // Load cookies from the saved file
-        // const cookies = JSON.parse(fs.readFileSync(path.join(__dirname, 'cookies.json')));
-        // await page.setCookie(...cookies);
-    
-        // // Navigate to content library
-        // await page.goto('https://www.amazon.com/hz/mycd/digital-console/contentlist/booksAll/dateDsc/');
+    for (const new_book of new_ebooks) {
 
-        let {browser, page} = await openBooksPage();
-    
-        startTime = 0;
-        let logged_in = await login_main(page, examinedTitles);
-        if(logged_in == false){
-            console.error(`Failed to log in`);
-            await hook.send(`Failed to log in`);
-            process.exit(-1);
+        if(!logged_in){
+            browser, page = await openBooksPage();
+        
+            startTime = 0;
+            let logged_in = await login_main(page, examinedTitles);
+            if(logged_in == false){
+                console.error(`Failed to log in`);
+                await hook.send(`Failed to log in`);
+                process.exit(-1);
+            }
         }
 
         // First, get the book entity
         let book_entity = await getBookEntityByTitle(page, title=new_book);
         if(!book_entity){
-            console.log(`Could not find entity for ${new_book}. May not have been added to Amazon yet.`);
-            try{
-                await browser.close();
-            }
-            catch(error){
-                console.log('Who cares.');
-            }
-            continue;
+            console.log(`Could not find entity for ${new_book}.`);
+            await hook.send(`Could not find entity for ${new_book}.`);
+            await browser.close();
+            process.exit(-1)
         }
         
         // next, try to download title
@@ -932,6 +926,7 @@ async function main() {
         }
 
         try{
+            logged_in = false;
             await browser.close();
         }
         catch(error){
@@ -968,7 +963,7 @@ async function main() {
             // Get the book entity
             let book_entity = await getBookEntityByTitle(page, book.title);
             if(!book_entity){
-                console.log(`Could not find entity for ${new_book}. May have been returned already.`);
+                console.log(`Could not find entity for ${book.title}. May have been returned already.`);
             }
             else{
                 // Return it!
@@ -993,14 +988,16 @@ async function main() {
 // validate the given config key
 async function validateConfig(key, value) {
     switch(key){
-        case "run_interval":
-            if(value < 0){
-                console.error(`Invalid run interval ${value} (must be positive)`);
+        case "headless":
+            // boolean
+            if (!(typeof value == "boolean")) {
+                console.error(`Invalid ${key} option (${value}). Must be boolean true or false.`);
                 process.exit(-1);
             }
             break;
 
         case "browser_path":
+            // string path to file that exists
             if (!fs.existsSync(value)) {
                 console.error(`Could not locate browser at "${value}". Update path in config.json.`);
                 process.exit(-1);
@@ -1008,18 +1005,111 @@ async function validateConfig(key, value) {
             break;
         
         case "downloads_dir":
+            // string path to directory that exists
             if (!fs.existsSync(value)) {
-                console.error(`Could not locate directory at "${value}". Update path in config.json.`);
+                console.error(`Could not locate downloads directory at "${value}". Update path in config.json.`);
                 process.exit(-1);
             }
             break;
 
         case "discord_webhook":
-            if(!hook && value){
+            // string. Creates hook if present.
+            if(!hook && value.length > 0){
                 console.debug('Creating Discord webhook');
                 hook = new Webhook(value);
             }
-            process.exit(-1)
+            break;
+        
+        case "calibre_lib_path":
+            // string path to directory containing metadata.db
+            const dbPath = path.join(value, 'metadata.db');
+            if (!fs.existsSync(dbPath)) {
+                console.error(`Could not locate Calibre metadata.db at "${value}". Update path in config.json.`);
+                process.exit(-1);
+            }
+            break;
+
+        case "device_name":
+            // string
+            if(value.length <= 0){
+                console.error(`Configure name of device for which book should be downloaded in config.json (${key}).`);
+                process.exit(-1);
+            }
+            break;
+
+        case "amazon_email":
+            // string
+            if(value.length <= 0){
+                console.error(`Configure Amazon login email in config.json (${key}).`);
+                process.exit(-1);
+            }
+
+            // Check if we have a keyring password saved for this email
+            if(!(await getCredentials(AMAZON_USER_NAMESPACE, value))){
+                // negative, see if there is a password in the config
+                if('amazon_password' in cnfg && cnfg.amazon_password){
+                    // found something, so register the credential
+                    storeCredentials(AMAZON_USER_NAMESPACE, value, cnfg.amazon_password);
+                    console.log('Saved Amazon login details to Windows Credential Manager.');
+                    delete cnfg.amazon_password
+                    fs.writeFileSync(configPath, JSON.stringify(cnfg, null, 2)); // Save with pretty print
+                    console.log('Removed Amazon password from config.json for security.');
+                }
+                else{
+                    console.error(`Configure Amazon password in config.json (amazon_password).\n\tCredentials will be saved to the Windows Credential Manager and then removed from config.\n\tThis can also be done manually by adding an entry under ${AMAZON_USER_NAMESPACE} in the Windows Credential Manager if you don't trust me.`)
+                    process.exit(-1);
+                }
+            }
+
+
+            break;
+
+        case "min_similarity":
+            // decimal between 0 and 1
+            if (value < 0 || value > 1){
+                console.error(`Invalid minimum similarity (${value}). Value must be between 0 and 1.`);
+                process.exit(-1);
+            }
+            break;
+
+        case "run_interval_sec":
+        case "return_after_hrs":
+            // positive integer
+            if (!(value === parseInt(value, 10)) || value <= 0){
+                console.error(`Invalid ${key} config option (${value}). Value must be a positive integer.`);
+                process.exit(-1);
+            }
+            break;
+
+        case "smtp_cnfg":
+            // object with a certain set of properties (not bothering to check types)
+            for(item of ['hostname', 'port', 'smtp_username', 'smtp_password', 'encryption', 'send_from']){
+                if (!(item in value)){
+                    console.error(`config.json ${key} missing key "${item}".\n\tSee https://manual.calibre-ebook.com/faq.html#i-cannot-send-emails-using-calibre for help.`);
+                    process.exit(-1);
+                }
+            }
+            break;
+
+        case "send_to_kindle_emails":
+            // object with string:string property value pairs
+            try {
+                if(!(typeof value === 'object' && value !== null)){
+                    throw new Error();
+                }
+
+                let emails = value;
+                for (const [email, deviceName] of Object.entries(emails)) {
+                    if(!(email.length > 0 && deviceName.length > 0)){
+                        throw new Error();
+                    }
+                }
+            } catch (error) {
+                console.log('config.json error - send_to_kindle_emails should be a JSON object. Each property should be a Kindle email address and the corresponding value should be the name of that device.');
+                process.exit(-1);
+            }
+            break;
+
         default:
             break;
     }
@@ -1027,40 +1117,32 @@ async function validateConfig(key, value) {
 
 // Load config dynamically
 async function loadConfig() {
-    try {
-        const configPath = path.join(__dirname, 'config.json');
-        // cnfg = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    if (fs.existsSync(configPath)) {
+        console.log('Found config file');
+    } 
+    else {
+        console.log('Creating config file');
+        fs.writeFileSync(configPath, JSON.stringify(dfltCnfg, null, 2)); // Save with pretty print
+    }
 
-        if (fs.existsSync(configPath)) {
-            console.log('Found config file');
-        } 
-        else {
-            console.log('Creating config file');
-            fs.writeFileSync(configPath, JSON.stringify(dfltCnfg, null, 2)); // Save with pretty print
+    cnfg = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    for (const [key, value] of Object.entries(dfltCnfg)) {
+        if (!(key in cnfg)){
+            cnfg[key] = value;
+            fs.writeFileSync(configPath, JSON.stringify(cnfg, null, 2)); // Save with pretty print
         }
+    }
 
-        cnfg = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-        for (const [key, value] of Object.entries(cnfg)) {
-            await validateConfig(key, value);
-        }
-
-        process.exit(0)
-
-        if(!hook && cnfg.discord_webhook){
-            hook = new Webhook(cnfg.discord_webhook);
-        }
-    } catch (error) {
-        console.error('Failed to load config:', error);
-        await hook.send('Failed to load config:', error);
-        process.exit(1); // Exit on critical error
+    for (const [key, value] of Object.entries(cnfg)) {
+        await validateConfig(key, value);
     }
 }
 
 async function executeMain() {
     await loadConfig();
     await main();
-    console.log('Next iteration in ' + cnfg.run_interval + 's');
-    setTimeout(executeMain, cnfg.run_interval * MSINS);
+    console.log('Next iteration in ' + cnfg.run_interval_sec + 's');
+    setTimeout(executeMain, cnfg.run_interval_sec * MSINS);
 }
 
 
